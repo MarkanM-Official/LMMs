@@ -27,7 +27,6 @@
 |------|------|
 | Founder | **Raj Singh** |
 | Co-Founder | **Adarsh Singh** |
-| Co-Founder | **Yash Raj** |
 
 ---
 
