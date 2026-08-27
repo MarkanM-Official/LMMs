@@ -1,16 +1,10 @@
-"""
-LSPManager — stdio ↔ JSON-RPC bridge between Monaco (JS) and a local LSP server.
-
-One instance is shared across all editor tabs (singleton via code_editor._get_lsp).
-"""
 import subprocess
 import json
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, QThread
 from lmms.gui.utils.output_channel import OutputChannelRegistry
 
-
-class LSPManager(QObject):
-    # LSP server response → JS (forwarded by PythonBridge.sendLspMessage)
+class DAPManager(QObject):
+    # DAP server response/event → JS or Python (forwarded as needed)
     messageReceived = pyqtSignal(str)
 
     def __init__(self, command: list, parent=None):
@@ -19,37 +13,38 @@ class LSPManager(QObject):
         self.process    = None
         self._thread    = None
         self.is_running = False
+        self.seq        = 1
 
     class ReadThread(QThread):
-        def __init__(self, lsp_manager):
+        def __init__(self, dap_manager):
             super().__init__()
-            self.lsp_manager = lsp_manager
+            self.dap_manager = dap_manager
             
         def run(self):
-            self.lsp_manager._read_loop()
+            self.dap_manager._read_loop()
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self):
         if not self.command:
-            return  # no LSP available
+            return
         try:
             self.process = subprocess.Popen(
                 self.command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=False,   # raw bytes — Content-Length framing
+                text=False,
             )
             self.is_running = True
             self._thread = self.ReadThread(self)
             self._thread.start()
-            OutputChannelRegistry.get_instance().append("LSP", f"[LSP] Process started (PID {self.process.pid}): {self.command}")
+            OutputChannelRegistry.get_instance().append("DAP", f"[DAP] Process started (PID {self.process.pid}): {self.command}")
         except FileNotFoundError:
-            OutputChannelRegistry.get_instance().append("LSP", f"[LSP] Command not found: {self.command[0]}. LSP disabled.")
+            OutputChannelRegistry.get_instance().append("DAP", f"[DAP] Command not found: {self.command[0]}")
             self.command = []
         except Exception as e:
-            OutputChannelRegistry.get_instance().append("LSP", f"[LSP] Failed to start {self.command}: {e}")
+            OutputChannelRegistry.get_instance().append("DAP", f"[DAP] Failed to start {self.command}: {e}")
             self.command = []
 
     def stop(self):
@@ -61,13 +56,12 @@ class LSPManager(QObject):
             except Exception:
                 pass
             self.process = None
-        OutputChannelRegistry.get_instance().append("LSP", "[LSP] Stopped.")
+        OutputChannelRegistry.get_instance().append("DAP", "[DAP] Stopped.")
 
-    # ── write (JS → LSP) ─────────────────────────────────────────────────────
+    # ── write (Python → DAP) ─────────────────────────────────────────────────────
 
     @pyqtSlot(str)
     def sendMessage(self, message: str):
-        """Forward a JSON-RPC message from the Monaco client to the LSP server."""
         if not self.process or not self.is_running:
             return
         try:
@@ -76,28 +70,34 @@ class LSPManager(QObject):
             self.process.stdin.write(header + body)
             self.process.stdin.flush()
         except Exception as e:
-            OutputChannelRegistry.get_instance().append("LSP", f"[LSP] Write error: {e}")
+            OutputChannelRegistry.get_instance().append("DAP", f"[DAP] Write error: {e}")
 
-    # ── read loop (LSP → JS) ──────────────────────────────────────────────────
+    def send_request(self, command: str, arguments: dict = None):
+        msg = {
+            "seq": self.seq,
+            "type": "request",
+            "command": command
+        }
+        if arguments:
+            msg["arguments"] = arguments
+            
+        self.seq += 1
+        self.sendMessage(json.dumps(msg))
+
+    # ── read loop (DAP → Python) ──────────────────────────────────────────────────
 
     def _read_loop(self):
-        """
-        Reads Content-Length–framed JSON-RPC from the LSP process stdout and
-        emits `messageReceived` so PythonBridge can forward it to the JS client.
-        """
         while self.is_running and self.process:
             try:
                 content_length = 0
-                # Read headers
                 while True:
                     raw = self.process.stdout.readline()
                     if not raw:
-                        # EOF — process died
                         self.is_running = False
                         return
                     line = raw.decode("utf-8", errors="replace").rstrip()
                     if not line:
-                        break   # empty line = end of headers
+                        break
                     if line.lower().startswith("content-length:"):
                         content_length = int(line.split(":", 1)[1].strip())
 
@@ -107,26 +107,8 @@ class LSPManager(QObject):
                 body_bytes = self.process.stdout.read(content_length)
                 body       = body_bytes.decode("utf-8", errors="replace")
 
-                # Side-effect: feed diagnostics to DiagnosticManager
-                self._handle_diagnostics(body)
-
-                # Forward to Monaco
                 self.messageReceived.emit(body)
-
             except Exception as e:
                 if self.is_running:
-                    OutputChannelRegistry.get_instance().append("LSP", f"[LSP] Read error: {e}")
+                    OutputChannelRegistry.get_instance().append("DAP", f"[DAP] Read error: {e}")
                 break
-
-    def _handle_diagnostics(self, body: str):
-        try:
-            msg = json.loads(body)
-            if msg.get("method") == "textDocument/publishDiagnostics":
-                params      = msg.get("params", {})
-                uri         = params.get("uri")
-                diagnostics = params.get("diagnostics", [])
-                if uri:
-                    from lmms.gui.utils.diagnostic_manager import DiagnosticManager
-                    DiagnosticManager.get_instance().update_diagnostics(uri, diagnostics)
-        except Exception:
-            pass
